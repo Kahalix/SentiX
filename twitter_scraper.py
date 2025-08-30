@@ -4,7 +4,6 @@ import time
 import urllib.parse
 import requests
 import platform as _platform
-from io import BytesIO
 from zipfile import ZipFile
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
@@ -13,21 +12,28 @@ from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import StaleElementReferenceException, WebDriverException
 from selenium.webdriver.common.keys import Keys
 
 import pandas as pd
-from tqdm.auto import tqdm  # ✅ progres
+from tqdm.auto import tqdm
 
 import config as cfg
 from store import TweetStore, HybridDeduper
 import checkpoints as ckp
 
-# ====== driver handle ======
+# ====== driver handle + fabryka (do autorestartu) ======
 driver = None
-def set_driver(drv):
+_driver_factory = None
+
+def set_driver(drv):  # main.py wywoła
     global driver
     driver = drv
+
+def register_driver_factory(factory):  # main.py wywoła
+    global _driver_factory
+    _driver_factory = factory
+
 
 # ====== cleaning helpers ======
 def _clean_tweet(text: str) -> str:
@@ -38,14 +44,14 @@ def _clean_tweet(text: str) -> str:
     return text.strip().lower()
 
 def _text_fallback_id_from_clean(text):
-    cleaned = _clean_tweet(text)
     import hashlib
     h = hashlib.sha1()
-    h.update(cleaned.encode('utf-8'))
+    h.update(_clean_tweet(text).encode('utf-8'))
     return "txt_" + h.hexdigest()
 
+
 # =========================
-# Chrome for Testing helpery
+# Chrome for Testing helpery + progres
 # =========================
 PLATFORM_MAP = {
     'Windows': {
@@ -106,7 +112,6 @@ def _find_downloads_for_channel(data, channel_name, desired_platform):
                 if 'chromedriver' in u and not res['chromedriver_url']: res['chromedriver_url'] = u
     return res
 
-# ===== Progresowe pobranie i rozpakowanie =====
 def _download_with_progress(url: str, dest_zip: Path):
     dest_zip.parent.mkdir(parents=True, exist_ok=True)
     with requests.get(url, stream=True, timeout=60) as r:
@@ -132,10 +137,8 @@ def _download_and_extract(url, target_dir: Path):
     temp_zip = target_dir / "_temp_download.zip"
     _download_with_progress(url, temp_zip)
     _extract_with_progress(temp_zip, target_dir)
-    try:
-        temp_zip.unlink()
-    except Exception:
-        pass
+    try: temp_zip.unlink()
+    except Exception: pass
 
 def _find_file_recursive(base_dir: Path, names):
     for root, dirs, files in os.walk(base_dir):
@@ -204,13 +207,13 @@ def ensure_chrome_and_driver(chrome_path_hint=None, driver_path_hint=None):
         _download_and_extract(info['chrome_url'], chrome_dir)
     else:
         print("⚠️ Nie znaleziono linku do pliku 'chrome'.")
-
     if info.get('chromedriver_url'):
         driver_dir = target_base / "chromedriver"
         _download_and_extract(info['chromedriver_url'], driver_dir)
     else:
         print("⚠️ Nie znaleziono linku do 'chromedriver'.")
 
+    sys_pl, arch, desired_platform = _detect_platform()
     exe_names = PLATFORM_MAP[sys_pl]['exe_names']; driver_names = PLATFORM_MAP[sys_pl]['driver_names']
     found_chrome = _find_file_recursive(target_base, exe_names)
     found_driver = _find_file_recursive(target_base, driver_names)
@@ -227,18 +230,13 @@ def ensure_chrome_and_driver(chrome_path_hint=None, driver_path_hint=None):
     else:
         print("❌ Nie znalazłem chromedrivera.")
 
-    if chrome_path and str(chrome_path).endswith('.app'):
-        candidate = Path(chrome_path) / 'Contents' / 'MacOS'
-        if candidate.exists():
-            for f in candidate.iterdir():
-                if f.is_file(): chrome_path = f; break
-
     if not chrome_path or not driver_path:
         raise RuntimeError("Brakuje 'chrome' lub 'chromedriver' po instalacji.")
     return str(chrome_path), str(driver_path)
 
+
 # =========================
-# detekcja overlay / rate limit / brak wyników
+# overlay / rate-limit / no-results
 # =========================
 def _find_retry_button():
     X = (
@@ -293,6 +291,20 @@ def _robust_click(el):
     except Exception:
         return False
 
+def _cooldown_with_progress(total_seconds: int, desc: str = "Cooldown (rate limit)"):
+    secs = int(max(0, total_seconds))
+    if secs <= 0:
+        return
+    try:
+        with tqdm(total=secs, desc=desc, unit="s") as pbar:
+            for _ in range(secs):
+                time.sleep(1)
+                pbar.update(1)
+    except KeyboardInterrupt:
+        print("⏭️ Przerwano cooldown — próbuję od razu.")
+    except Exception:
+        time.sleep(secs)
+
 def wait_and_handle_errors(quick_tries=3, quick_interval=3, cooldown_sec=cfg.RATE_LIMIT_COOLDOWN):
     """
     Zwraca: 'ok' | 'no_results' | 'blocked_recovered' | 'blocked_still'
@@ -307,7 +319,6 @@ def wait_and_handle_errors(quick_tries=3, quick_interval=3, cooldown_sec=cfg.RAT
         return 'no_results'
 
     if _has_error_overlay():
-        # szybkie próby kliknięcia/refresh
         for _ in range(quick_tries):
             btn = _find_retry_button()
             if btn: _robust_click(btn)
@@ -325,12 +336,9 @@ def wait_and_handle_errors(quick_tries=3, quick_interval=3, cooldown_sec=cfg.RAT
             if not _has_error_overlay():
                 return 'ok'
 
-        # --- pasek postępu na cooldownie ---
-        mins = int(cooldown_sec) // 60
-        print(f"⏳ Podejrzenie blokady/rate-limit — czekam {mins} min...")
+        print(f"⏳ Podejrzenie blokady/rate-limit — czekam {cooldown_sec//60} min...")
         _cooldown_with_progress(int(cooldown_sec), desc="Cooldown (rate limit)")
 
-        # po cooldownie spróbuj ponownie
         btn = _find_retry_button()
         if btn: _robust_click(btn)
         else:
@@ -351,68 +359,100 @@ def wait_and_handle_errors(quick_tries=3, quick_interval=3, cooldown_sec=cfg.RAT
 
     return 'ok'
 
-def _cooldown_with_progress(total_seconds: int, desc: str = "Cooldown (rate limit)"):
-    """
-    Odlicza 'total_seconds' w dół z paskiem tqdm.
-    Bezpieczny na Ctrl+C – przerwanie skraca czekanie i od razu przechodzimy dalej.
-    """
-    secs = int(max(0, total_seconds))
-    if secs <= 0:
-        return
-    try:
-        from tqdm.auto import tqdm
-        with tqdm(total=secs, desc=desc, unit="s") as pbar:
-            for _ in range(secs):
-                time.sleep(1)
-                pbar.update(1)
-    except KeyboardInterrupt:
-        print("⏭️ Przerwano cooldown — próbuję od razu.")
-        return
-    except Exception:
-        # w razie problemów z tqdm – klasyczny sleep
-        time.sleep(secs)
+
+# =========================
+# odporny get (retry + ewentualny restart drivera)
+# =========================
+def _robust_get(url: str, attempts: int = 3, wait_after: float = 2.0):
+    global driver, _driver_factory
+    for i in range(1, attempts + 1):
+        try:
+            driver.get(url)
+            time.sleep(wait_after)
+            return True
+        except Exception as e:
+            print(f"⚠️ driver.get timeout/err (próba {i}/{attempts}): {e}")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            if i < attempts and _driver_factory is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                try:
+                    driver = _driver_factory()
+                    set_driver(driver)
+                    print("🔁 Odtworzyłem przeglądarkę i spróbuję ponownie...")
+                except Exception as e2:
+                    print(f"❌ Nie udało się odtworzyć drivera: {e2}")
+            else:
+                return False
+
 
 # =========================
 # tweet id + czas + url
 # =========================
 def _get_tweet_id_and_dt(el):
+    tweet_id = None; dt = None; url = None
     try:
         link = el.find_element(By.XPATH, ".//ancestor::article//a[contains(@href,'/status/')]")
         href = link.get_attribute("href") or ""
+        url = href
         m = re.search(r'/status/(\d+)', href)
         tweet_id = m.group(1) if m else None
     except Exception:
-        tweet_id, href = None, None
+        url = None
+        tweet_id = None
     try:
         time_el = el.find_element(By.XPATH, ".//ancestor::article//time")
         ts = time_el.get_attribute("datetime")
         dt = datetime.fromisoformat(ts.replace('Z', '+00:00')) if ts else None
     except Exception:
         dt = None
-    return tweet_id, dt, href
+    return tweet_id, dt, url
+
 
 # =========================
-# właściwe scrapowanie (1 zakres)
+# właściwe scrapowanie (1 podzakres)
 # =========================
-def fetch_tweets(keyword: str, since_incl: str, until_incl: str, max_tweets: int = 200, deduper: HybridDeduper = None):
+def fetch_tweets(keyword: str, since_incl: str, until_incl: str, max_tweets: int = 200, deduper=None):
+    if deduper is None:
+        class _Local:
+            def __init__(self): self._s = set()
+            def contains(self, u): return u in self._s
+            def add(self, u): self._s.add(u)
+            def bulk_add(self, seq): self._s.update(seq)
+            def close(self): pass
+        deduper = _Local()
+
     since_dt = datetime.fromisoformat(since_incl)
     until_dt = datetime.fromisoformat(until_incl)
     until_excl = (until_dt + timedelta(days=1)).strftime("%Y-%m-%d")
     query = f"{keyword} since:{since_dt.strftime('%Y-%m-%d')} until:{until_excl}"
     url   = "https://mobile.twitter.com/search?q=" + urllib.parse.quote(query) + "&f=live"
     print(f"\n🔗 Otwieram: {url}")
-    driver.get(url); time.sleep(2)
+
+    ok = _robust_get(url)
+    if not ok:
+        print("❌ Nie udało się wczytać strony po próbach — przerywam ten slice.")
+        return [], [], [], []
+
+    # wstępne ogarnięcie overlay
+    status = wait_and_handle_errors()
+    if status == 'no_results':
+        print("ℹ️ Brak wyników dla tego zakresu.")
+        return [], [], [], []
 
     texts, dates, ids, urls = [], [], [], []
     seen_ids = set()
     last_h = driver.execute_script("return document.body.scrollHeight")
 
     while len(texts) < max_tweets:
-        state = wait_and_handle_errors()
-        if state == 'no_results':
-            print("ℹ️ Brak wyników dla tego zakresu."); break
-        elif state == 'blocked_still':
-            print("❌ Wciąż blokada po cooldownie — przerywam."); break
+        st = wait_and_handle_errors()
+        if st in ('no_results', 'blocked_still'):
+            break
 
         els = driver.find_elements(By.XPATH, '//div[@data-testid="tweetText"]')
         for el in els:
@@ -425,18 +465,11 @@ def fetch_tweets(keyword: str, since_incl: str, until_incl: str, max_tweets: int
 
             tweet_id, dt, href = _get_tweet_id_and_dt(el)
             uid = tweet_id if tweet_id else _text_fallback_id_from_clean(raw)
-            if uid in seen_ids:
+            if uid in seen_ids or deduper.contains(uid):
                 continue
 
-            if deduper is not None:
-                if deduper.contains(uid):
-                    continue
-                else:
-                    deduper.add(uid)
-
-            seen_ids.add(uid)
+            seen_ids.add(uid); deduper.add(uid)
             texts.append(raw); dates.append(dt); ids.append(uid); urls.append(href)
-
             if len(texts) >= max_tweets:
                 break
 
@@ -444,8 +477,8 @@ def fetch_tweets(keyword: str, since_incl: str, until_incl: str, max_tweets: int
         time.sleep(2)
         new_h = driver.execute_script("return document.body.scrollHeight")
         if new_h == last_h:
-            state2 = wait_and_handle_errors(quick_tries=2, quick_interval=2)
-            if state2 in ('no_results', 'blocked_still'):
+            st2 = wait_and_handle_errors(quick_tries=2, quick_interval=2)
+            if st2 in ('no_results', 'blocked_still'):
                 break
             new_h = driver.execute_script("return document.body.scrollHeight")
             if new_h == last_h:
@@ -454,15 +487,17 @@ def fetch_tweets(keyword: str, since_incl: str, until_incl: str, max_tweets: int
 
     return texts, dates, ids, urls
 
+
 # =========================
-# scrapowanie w podoknach + zapis do DB + checkpoint RAW + resume RAW + PROGRESS BAR
+# scrapowanie w podoknach + zapis do DB + checkpoint RAW + ZWRACANIE LIST
 # =========================
-def fetch_tweets_in_periods(keyword: str, since: str, until: str, max_tweets: int,
-                            collection_name: str, resume_raw: bool = False):
+def fetch_tweets_in_periods(keyword: str, since: str, until: str, max_tweets: int = 200,
+                            collection_name: str = None, resume_raw: bool = False):
     start_dt = datetime.fromisoformat(since)
     end_dt   = datetime.fromisoformat(until)
     total_days = (end_dt.date() - start_dt.date()).days + 1
 
+    # dzielimy na miesiące, a miesiące na <=31 slice’y
     periods = []
     cur = start_dt
     while cur <= end_dt:
@@ -478,58 +513,75 @@ def fetch_tweets_in_periods(keyword: str, since: str, until: str, max_tweets: in
     for i in range(abs(diff)):
         j = idx_ord[i % len(quotas)]
         quotas[j] -= 1 if diff>0 else -1
+        if quotas[j] < 0: quotas[j] = 0
 
     texts_all, dates_all, ids_all, urls_all = [], [], [], []
 
+    # DB i kolekcja (jeśli jest)
     store = TweetStore(cfg.DB_PATH)
-    coll_id = store.get_or_create_collection(collection_name)
+    coll_id = None
+    if collection_name:
+        try:
+            if hasattr(store, "get_or_create_collection"):
+                coll_id = store.get_or_create_collection(collection_name)
+            elif hasattr(store, "ensure_collection"):
+                coll_id = store.ensure_collection(collection_name)
+        except Exception as e:
+            print(f"⚠️ Nie mogę utworzyć/odczytać kolekcji: {e}")
 
-    # Resume RAW z checkpointa
+    # Resume RAW z checkpointa (jeśli ktoś korzysta)
     if resume_raw:
-        pre = ckp.load_raw_progress_latest(collection_name, since, until)
-        if pre:
-            pre_ids, pre_texts, pre_dates, pre_urls = pre
-            ids_all.extend(pre_ids); texts_all.extend(pre_texts); dates_all.extend(pre_dates); urls_all.extend(pre_urls)
-            rows = []
-            for _id, _t, _dt, _u in zip(pre_ids, pre_texts, pre_dates, pre_urls):
-                dt_iso = _dt.isoformat() if isinstance(_dt, datetime) else (None if pd.isna(_dt) else str(_dt))
-                rows.append((_id, _t, dt_iso, _u))
-            store.upsert_many(rows)
-            store.link_many(pre_ids, coll_id)
-            print(f"↩️ Resume RAW: {len(pre_ids)} tweetów już w checkpointach — dołączono.")
+        prev_df = ckp.load_raw_progress_latest(collection_name or keyword, since, until)
+        if prev_df is not None and not prev_df.empty:
+            try:
+                ids_all  = prev_df["id"].tolist()
+                texts_all = prev_df["raw_text"].tolist()
+                dates_all = list(prev_df["date"])
+                urls_all  = prev_df.get("url", pd.Series([None]*len(ids_all))).tolist()
+                print(f"↩️ Resume RAW: przywrócono {len(ids_all)} rekordów z checkpointu.")
+                # spróbuj dograć do DB
+                if coll_id is not None and ids_all:
+                    rows = []
+                    for _id, _t, _dt, _u in zip(ids_all, texts_all, dates_all, urls_all):
+                        dt_iso = _dt.isoformat() if isinstance(_dt, datetime) else (None if pd.isna(_dt) else str(_dt))
+                        rows.append((_id, _t, dt_iso, _u))
+                    _db_write_bulk(store, rows, coll_id)
+            except Exception as e:
+                print(f"⚠️ Resume RAW nie powiódł się: {e}")
 
+    # Deduper (Bloom opcjonalnie)
     deduper = None
     if cfg.USE_BLOOM:
-        deduper = HybridDeduper(sqlite_path=cfg.DB_PATH, expected_n=max(1000, max_tweets*2),
-                                fp_rate=1e-5, load_bloom=cfg.BLOOM_SERIAL)
+        deduper = HybridDeduper(sqlite_path=cfg.DB_PATH.replace(".sqlite","_ids.sqlite"),
+                                expected_n=max(1000, max_tweets*2), fp_rate=1e-5,
+                                load_bloom=cfg.BLOOM_SERIAL)
         if ids_all:
-            deduper.bulk_add(ids_all)
+            try: deduper.bulk_add(ids_all)
+            except Exception: pass
+    else:
+        class _Local:
+            def __init__(self): self._s=set()
+            def contains(self,u): return u in self._s
+            def add(self,u): self._s.add(u)
+            def bulk_add(self,seq): self._s.update(seq)
+            def close(self): pass
+        deduper = _Local()
+        if ids_all: deduper.bulk_add(ids_all)
 
-    # Timery checkpointów
-    last_save_time = time.time()
-    last_saved_count = len(texts_all)
-
-    RETRIES_PER_SLICE = 3
-    BACKOFFS = [2, 5, 10]
-
-    # === PROGRESS BAR ===
+    last_raw_save_ts = time.time()
     pbar = tqdm(total=max_tweets, initial=len(texts_all),
-                desc=f"Scraping '{keyword}' [{since}..{until}]",
-                unit="tw")
+                desc=f"Scraping '{keyword}' [{since}..{until}]", unit="tw")
 
     try:
-        if len(texts_all) >= max_tweets:
-            print(f"✅ Resume RAW: osiągnięto limit {max_tweets} — nic do scrapowania.")
-        else:
+        if len(texts_all) < max_tweets:
             for (period, quota) in zip(periods, quotas):
-                if len(texts_all) >= max_tweets:
-                    break
+                if len(texts_all) >= max_tweets: break
 
                 p_start = period[0].date()
                 p_end   = period[1].date()
                 days = (p_end - p_start).days + 1
 
-                slices = min(days, quota, 31) or 1
+                slices = min(days, max(1, min(quota, 31)))
                 base, rem = days // slices, days % slices
                 slice_lengths = [base + (1 if i < rem else 0) for i in range(slices)]
                 slice_quotas  = [max(1, round(quota * sl / days)) for sl in slice_lengths]
@@ -538,73 +590,104 @@ def fetch_tweets_in_periods(keyword: str, since: str, until: str, max_tweets: in
                 for i in range(abs(sd)):
                     j = idx_ord_s[i % len(slice_quotas)]
                     slice_quotas[j] -= 1 if sd>0 else -1
-                    if slice_quotas[j] < 0:
-                        slice_quotas[j] = 0
+                    if slice_quotas[j] < 0: slice_quotas[j] = 0
 
                 cur_day = p_start
                 for sl_len, sl_q in zip(slice_lengths, slice_quotas):
-                    if len(texts_all) >= max_tweets:
-                        break
+                    if len(texts_all) >= max_tweets: break
                     if sl_q <= 0:
-                        cur_day = cur_day + timedelta(days=sl_len)
-                        continue
+                        cur_day = cur_day + timedelta(days=sl_len); continue
 
                     slice_since = cur_day.isoformat()
                     slice_until = (cur_day + timedelta(days=sl_len-1)).isoformat()
                     remaining   = max_tweets - len(texts_all)
-                    needed_for_slice = min(sl_q, remaining)
-                    if needed_for_slice <= 0:
-                        cur_day = cur_day + timedelta(days=sl_len)
-                        continue
+                    need_here   = min(sl_q, remaining)
+                    if need_here <= 0:
+                        cur_day = cur_day + timedelta(days=sl_len); continue
 
-                    slice_attempt = 0
-                    while needed_for_slice > 0 and slice_attempt < RETRIES_PER_SLICE and len(texts_all) < max_tweets:
-                        want = min(needed_for_slice, max_tweets - len(texts_all))
-                        print(f"Pobieram {keyword} {slice_since}..{slice_until} (chcę {want}; próba {slice_attempt+1}/{RETRIES_PER_SLICE})")
+                    attempts = 0
+                    while need_here > 0 and attempts < 3 and len(texts_all) < max_tweets:
+                        want = min(need_here, max_tweets - len(texts_all))
+                        print(f"Pobieram {keyword} {slice_since}..{slice_until} (chcę {want}; próba {attempts+1}/3)")
                         txts, dts, ids, urls = fetch_tweets(keyword, slice_since, slice_until, want, deduper=deduper)
 
+                        # akumulacja
                         texts_all.extend(txts); dates_all.extend(dts); ids_all.extend(ids); urls_all.extend(urls)
-
-                        # update progress bar
                         added = len(txts)
                         if added > 0:
                             pbar.update(added)
                             pbar.set_postfix_str(f"{len(texts_all)}/{max_tweets}")
 
-                        # Zapis do DB + link do kolekcji
-                        rows = []
-                        for _id, _t, _dt, _u in zip(ids, txts, dts, urls):
-                            dt_iso = _dt.isoformat() if isinstance(_dt, datetime) else None
-                            rows.append((_id, _t, dt_iso, _u))
-                        store.upsert_many(rows)
-                        store.link_many(ids, coll_id)
+                            # zapis do DB
+                            if collection_name and ids:
+                                rows = []
+                                for _id, _t, _dt, _u in zip(ids, txts, dts, urls):
+                                    dt_iso = _dt.isoformat() if isinstance(_dt, datetime) else None
+                                    rows.append((_id, _t, dt_iso, _u))
+                                _db_write_bulk(store, rows, coll_id)
 
-                        # RAW checkpoint?
-                        now = time.time()
-                        got_since_last = len(texts_all) - last_saved_count
-                        if got_since_last >= cfg.RAW_PROGRESS_EVERY_N_TWEETS or (now - last_save_time) >= cfg.RAW_PROGRESS_EVERY_SEC:
-                            ckp.save_raw_progress(collection_name, since, until, ids_all, texts_all, dates_all, urls_all)
-                            last_saved_count = len(texts_all)
-                            last_save_time = now
+                        # checkpoint RAW (tylko gdy wznawiamy)
+                        if resume_raw and added > 0:
+                            now = time.time()
+                            if (now - last_raw_save_ts) >= cfg.RAW_PROGRESS_EVERY_SEC or added >= cfg.RAW_PROGRESS_EVERY_N_TWEETS:
+                                df = pd.DataFrame({"id": ids_all, "raw_text": texts_all, "date": dates_all, "url": urls_all})
+                                ckp.save_raw_progress(collection_name or keyword, since, until, df)
+                                last_raw_save_ts = now
 
-                        needed_for_slice -= added
-                        print(f"   → Dodano {added}. Pozostało do zebrania w tym slice: {needed_for_slice}")
+                        need_here -= added
+                        print(f"   → Dodano {added}. Pozostało do zebrania w tym slice: {need_here}")
 
-                        slice_attempt += 1
-                        if needed_for_slice > 0 and slice_attempt < RETRIES_PER_SLICE:
+                        attempts += 1
+                        if need_here > 0 and attempts < 3:
                             state = wait_and_handle_errors(quick_tries=2, quick_interval=2)
-                            if state in ('no_results', 'blocked_still'):
-                                break
-                            time.sleep(BACKOFFS[min(slice_attempt-1, len(BACKOFFS)-1)])
+                            if state in ('no_results', 'blocked_still'): break
+                            time.sleep([2,5,10][min(attempts-1, 2)])
 
                     cur_day = cur_day + timedelta(days=sl_len)
 
         print(f"✅ Zebrano łącznie {len(texts_all)}/{max_tweets} tweetów (w tej operacji).")
     finally:
         pbar.close()
-        if deduper is not None:
-            deduper.save_bloom(cfg.BLOOM_SERIAL)
-            deduper.close()
+        try:
+            if cfg.USE_BLOOM and hasattr(deduper, "close"):
+                try:
+                    deduper.save_bloom(cfg.BLOOM_SERIAL)
+                except Exception:
+                    pass
+                deduper.close()
+        except Exception:
+            pass
         store.close()
 
+    # ZWRACAMY LISTY dla analyzer.py
     return texts_all[:max_tweets], dates_all[:max_tweets], ids_all[:max_tweets], urls_all[:max_tweets]
+
+
+def _db_write_bulk(store: TweetStore, rows, coll_id):
+    try:
+        if hasattr(store, "upsert_many") and hasattr(store, "link_many"):
+            store.upsert_many(rows)
+            if coll_id is not None:
+                ids = [r[0] for r in rows]
+                store.link_many(ids, coll_id)
+        elif hasattr(store, "upsert_tweets_bulk"):
+            ids = [r[0] for r in rows]
+            texts = [r[1] for r in rows]
+            dts = [r[2] for r in rows]
+            urls = [r[3] for r in rows]
+            store.upsert_tweets_bulk(coll_id, ids, texts, dts, urls)
+        elif hasattr(store, "insert_tweets_bulk"):
+            ids = [r[0] for r in rows]
+            texts = [r[1] for r in rows]
+            dts = [r[2] for r in rows]
+            urls = [r[3] for r in rows]
+            store.insert_tweets_bulk(coll_id, ids, texts, dts, urls)
+        else:
+            # fallback: pojedynczo
+            for _id, _t, _dt, _u in rows:
+                if hasattr(store, "upsert_tweet"):
+                    store.upsert_tweet(coll_id, _id, _t, _dt, _u)
+                elif hasattr(store, "insert_tweet"):
+                    store.insert_tweet(coll_id, _id, _t, _dt, _u)
+    except Exception as e:
+        print(f"⚠️ Błąd zapisu do DB: {e}")
