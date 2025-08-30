@@ -1,0 +1,12 @@
+selenium
+transformers
+torch
+pandas
+matplotlib
+wordcloud
+python-dateutil
+requests
+stopwordsiso
+Pillow
+tqdm
+pyarrow
