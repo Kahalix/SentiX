@@ -25,7 +25,7 @@ USE_BLOOM = False
 BLOOM_SERIAL = str(DB_DIR / "tweet_ids_bloom.pickle")
 
 # Rate-limit cooldown (sekundy)
-RATE_LIMIT_COOLDOWN = 600
+RATE_LIMIT_COOLDOWN = 450
 
 # Checkpointy / progres
 RAW_PROGRESS_EVERY_N_TWEETS = 100
@@ -40,6 +40,6 @@ USER_DATA_DIR = str((Path.cwd() / "browser" / "profile").resolve())
 # Headless (logowanie Twitter potrafi być problematyczne)
 HEADLESS = False
 
-# ===== Nowe: przełączniki zapisów wyników =====
+# ===== Przełączniki zapisów wyników =====
 SAVE_CSV = True
 SAVE_PARQUET = True

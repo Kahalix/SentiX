@@ -1,0 +1,20 @@
+# venv & python cache
+venv/
+__pycache__/
+*.pyc
+
+# local data
+db/tweets.sqlite
+db/tweet_ids_bloom.pickle
+db/checkpoints/
+results/
+
+# chrome for testing binaries & profile
+browser/chrome_for_testing/
+browser/chrome-win64/
+browser/chromedriver/
+browser/profile/
+
+# editor/OS junk
+.DS_Store
+Thumbs.db
